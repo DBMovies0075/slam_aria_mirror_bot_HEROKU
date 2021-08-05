@@ -2,9 +2,12 @@ import logging
 import re
 import threading
 import time
+import math
 
 from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot import download_dict, download_dict_lock
+from bot import dispatcher, download_dict, download_dict_lock, STATUS_LIMIT
+from bot.helper.telegram_helper import button_build, message_utils
+from telegram import InlineKeyboardMarkup
 
 LOGGER = logging.getLogger(__name__)
 
@@ -12,18 +15,22 @@ MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
 
+COUNT = 0
+PAGE_NO = 1
 
 class MirrorStatus:
-    STATUS_UPLOADING = "Uploading...📤"
-    STATUS_DOWNLOADING = "Downloading...📥"
+    STATUS_UPLOADING = "Uploading...⏫"
+    STATUS_DOWNLOADING = "Downloading...⏬"
+    STATUS_CLONING = "Cloning...♻️"
     STATUS_WAITING = "Queued...📝"
-    STATUS_FAILED = "Failed 🚫. Cleaning Download..."
+    STATUS_FAILED = "Failed 🚫. Cleaning download"
+    STATUS_CANCELLED = "Cancelled ❎"
     STATUS_ARCHIVING = "Archiving...🔐"
     STATUS_EXTRACTING = "Extracting...📂"
 
 
 PROGRESS_MAX_SIZE = 100 // 8
-PROGRESS_INCOMPLETE = ['★', '★', '★', '★', '★', '★', '★']
+PROGRESS_INCOMPLETE = ['▓', '▓', '▓', '▓', '▓', '▓', '▓']
 
 SIZE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
 
@@ -69,13 +76,6 @@ def getDownloadByGid(gid):
                     return dl
     return None
 
-def getAllDownload():
-    with download_dict_lock:
-        for dlDetails in list(download_dict.values()):
-            if dlDetails.status() == MirrorStatus.STATUS_DOWNLOADING \
-                    or dlDetails.status() == MirrorStatus.STATUS_WAITING:
-                if dlDetails:
-                    return dlDetails
 
 def get_progress_bar_string(status):
     completed = status.processed_bytes() / 8
@@ -87,10 +87,10 @@ def get_progress_bar_string(status):
     p = min(max(p, 0), 100)
     cFull = p // 8
     cPart = p % 8 - 1
-    p_str = '★' * cFull
+    p_str = '▓' * cFull
     if cPart >= 0:
         p_str += PROGRESS_INCOMPLETE[cPart]
-    p_str += ' ' * (PROGRESS_MAX_SIZE - cFull)
+    p_str += '░' * (PROGRESS_MAX_SIZE - cFull)
     p_str = f"[{p_str}]"
     return p_str
 
@@ -98,27 +98,75 @@ def get_progress_bar_string(status):
 def get_readable_message():
     with download_dict_lock:
         msg = ""
-        msg = ""
+        INDEX = 0
+        if STATUS_LIMIT is not None:
+            dick_no = len(download_dict)
+            global pages
+            pages = math.ceil(dick_no/STATUS_LIMIT)
+            if PAGE_NO > pages and pages != 0:
+                globals()['COUNT'] -= STATUS_LIMIT
+                globals()['PAGE_NO'] -= 1
         for download in list(download_dict.values()):
-            msg += f"<b>☞ 🗃️File :</b> <code>{download.name()}</code>"
-            msg += f"\n<b>☞ 🚦Status :</b> <b>{download.status()}</b>"
-            if download.status() != MirrorStatus.STATUS_ARCHIVING and download.status() != MirrorStatus.STATUS_EXTRACTING:
-                msg += f"\n<b>☞ 📝Progress :</b> <code>{get_progress_bar_string(download)}</code> <b>{download.progress()}</b>"
-                if download.status() == MirrorStatus.STATUS_DOWNLOADING:
-                    msg += f"\n<b>☞ 📥Downloaded :</b> <b>{get_readable_file_size(download.processed_bytes())}</b> <b>Of</b> <b>{download.size()}</b>" 
-                else:
-                    msg += f"\n<b>☞ 📤Uploaded :</b> <b>{get_readable_file_size(download.processed_bytes())}</b> <b>Of</b> <b>{download.size()}</b>"
-                msg += f"\n<b>☞⚡️ Speed :</b> {download.speed()} || <b>☞ ETA:</b> {download.eta()} "
-                # if hasattr(download, 'is_torrent'):
-                try:
-                    msg += f"\n<b>☞ Peers :</b> {download.aria_download().connections} " \
-                           f"|| <b>☞ Seeders :</b> {download.aria_download().num_seeders}"
-                except:
-                    pass
-            if download.status() == MirrorStatus.STATUS_DOWNLOADING:
-                msg += f"\n<b>☞ To cancel ❌</b>: <code>/cancel {download.gid()}</code>"
-            msg += "\n\n"
-        return msg
+            INDEX += 1
+            if INDEX > COUNT:
+                msg += f'<b>╭──「  ⭕️ Progress Bar {INDEX} ⭕️  」</b>\n' \
+                       f'<b>│</b>\n'
+                msg += f"\n<b>├  📂 𝐅𝐢𝐥𝐞𝐧𝐚𝐦𝐞:</b> <code>{download.name()}</code>"
+                msg += f"\n\n<b>├   🚦 𝐒𝐭𝐚𝐭𝐮𝐬:</b> <i>{download.status()}</i>"
+                if download.status() != MirrorStatus.STATUS_ARCHIVING and download.status() != MirrorStatus.STATUS_EXTRACTING:
+                    msg += f"\n<b>├  </b><code>{get_progress_bar_string(download)} {download.progress()}</code>"
+                    if download.status() == MirrorStatus.STATUS_DOWNLOADING:
+                        msg += f"\n<b>├  📥 𝐃𝐨𝐰𝐧𝐥𝐨𝐚𝐝𝐞𝐝:</b> {get_readable_file_size(download.processed_bytes())} of {download.size()}"
+                    elif download.status() == MirrorStatus.STATUS_CLONING:
+                        msg += f"\n<b>├  ♻ 𝐂𝐥𝐨𝐧𝐞𝐝:</b> {get_readable_file_size(download.processed_bytes())} of {download.size()}"
+                    else:
+                        msg += f"\n<b>├  📤 𝐔𝐩𝐥𝐨𝐚𝐝𝐞𝐝:</b> {get_readable_file_size(download.processed_bytes())} of {download.size()}"
+                    msg += f"\n<b>├  ⚡ 𝐒𝐩𝐞𝐞𝐝:</b> {download.speed()}" \
+                            f"\n<b>├  ⏳ 𝐄𝐓𝐀:</b> {download.eta()} "
+                    # if hasattr(download, 'is_torrent'):
+                    try:
+                        msg += f"\n<b>├  🟢 𝐒𝐞𝐞𝐝𝐞𝐫𝐬:</b> {download.aria_download().num_seeders}" \
+                            f"\n<b>├  🔴 𝐏𝐞𝐞𝐫𝐬:</b> {download.aria_download().connections}"
+                    except:
+                        pass
+                    msg += f'\n<b>├  👤 𝐔𝐬𝐞𝐫:</b> <a href="tg://user?id={download.message.from_user.id}">{download.message.from_user.first_name}</a>'
+                    msg += f"\n<b>├  🗑 𝐓𝐨 𝐒𝐭𝐨𝐩:\n├  GID: </b> <code>/{BotCommands.CancelMirror} {download.gid()}</code>"
+                msg += f'<b>│</b>\n' \
+                       f'<b>╰──「 🚸 DB Movies 🚸 」</b>\n'
+                if STATUS_LIMIT is not None:
+                    if INDEX >= COUNT + STATUS_LIMIT:
+                        break
+        if STATUS_LIMIT is not None:
+            if INDEX > COUNT + STATUS_LIMIT:
+                return None, None
+            if dick_no > STATUS_LIMIT:
+                msg += f"Page: {PAGE_NO}/{pages} | Tasks: {dick_no}\n"
+                buttons = button_build.ButtonMaker()
+                buttons.sbutton("Previous", "pre")
+                buttons.sbutton("Next", "nex")
+                button = InlineKeyboardMarkup(buttons.build_menu(2))
+                return msg, button
+        return msg, ""
+
+def flip(update, context):
+    query = update.callback_query
+    query.answer()
+    global COUNT, PAGE_NO
+    if query.data == "nex":
+        if PAGE_NO == pages:
+            COUNT = 0
+            PAGE_NO = 1
+        else:
+            COUNT += STATUS_LIMIT
+            PAGE_NO += 1
+    elif query.data == "pre":
+        if PAGE_NO == 1:
+            COUNT = STATUS_LIMIT * (pages - 1)
+            PAGE_NO = pages
+        else:
+            COUNT -= STATUS_LIMIT
+            PAGE_NO -= 1
+    message_utils.update_all_messages()
 
 
 def get_readable_time(seconds: int) -> str:
@@ -146,6 +194,13 @@ def is_url(url: str):
         return True
     return False
 
+
+def is_magnet(url: str):
+    magnet = re.findall(MAGNET_REGEX, url)
+    if magnet:
+        return True
+    return False
+
 def is_gdrive_link(url: str):
     return "drive.google.com" in url
 
@@ -161,11 +216,6 @@ def get_mega_link_type(url: str):
         return "folder"
     return "file"
 
-def is_magnet(url: str):
-    magnet = re.findall(MAGNET_REGEX, url)
-    if magnet:
-        return True
-    return False
 
 def new_thread(fn):
     """To use as decorator to make a function call threaded.
